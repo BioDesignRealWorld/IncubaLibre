@@ -16,12 +16,12 @@
 #define ENTER_CRIT()    {char volatile saved_sreg = SREG; cli()
 #define LEAVE_CRIT()    SREG = saved_sreg;}
 
-// Time interval is 1MHz/16384/256
-#define TIME_INTERVAL 4.194
-#define TIME_INTERVAL_INV 0.238
+// Time interval is 1MHz/1024/256
+#define TIME_INTERVAL 0.2621
+#define TIME_INTERVAL_INV 3.815
 
 // the state variable
-#define MEASURE 0
+#define HEAT 0
 #define WAIT 1
 static uint8_t state = WAIT;
 
@@ -33,31 +33,32 @@ uint8_t trimpot_val = 0;
 uint8_t pot_bits = 2;
 float temperature_avg = 0.;
 uint8_t temp_avg_n = 0;
-float temperature_avg_previous = 0.;
 
 // Temperature set point
 float temperature_setPoints[4] = { 0.0, 37.5, 40.0, 45.0 };
 
 // PID constants
 float K_p = 10.;
-float K_i = 2.;
-float K_d = 1.;
+float K_i = 0.5;
+float K_d = 0.0;
 
 // PID values
+float error_previous = 0.;
 float ITerm = 0.0;
 
-// The PWM value between 0 and 255
-#define PWM_MAX 250
+// We limit PWM value to 4 from below to spare the relay
+// and to 128 from above to avoid overheating of the incubator
+#define PWM_MAX 200
 #define PWM_MIN 6
 uint8_t pwm_val = 0;
 
 // Relay and LEDs macros
-#define RELAY_ON()  PORTB &= ~(1 << PB1);
-#define RELAY_OFF() PORTB |= (1 << PB1);
-#define LED1_ON()   PORTB |= (1 << PB0);
-#define LED1_OFF()  PORTB &= ~(1 << PB0);
-#define LED2_ON()   PORTB |= (1 << PB4);
-#define LED2_OFF()  PORTB &= ~(1 << PB4);
+#define RELAY_ON()  PORTB &= ~(1 << PB1)
+#define RELAY_OFF() PORTB |= (1 << PB1)
+#define LED1_ON()   PORTB |= (1 << PB0)
+#define LED1_OFF()  PORTB &= ~(1 << PB0)
+#define LED2_ON()   PORTB |= (1 << PB4)
+#define LED2_OFF()  PORTB &= ~(1 << PB4)
 
 // Look-up table of Thermistor values
 const float therm_lut[] PROGMEM = { -66.89, -53.98, -47.36, -42.76, -39.19, -36.24, -33.71, -31.49, -29.51, -27.72, 
@@ -104,13 +105,11 @@ void measure_temperature()
 
   // We only use the 8 upper bit of the ADC value
   // for the temperature
-  uint8_t low = ADCL;
   uint8_t high = ADCH;
-  //uint8_t index = (high << 6) | (low >> 2);
 
   // average the temperature measurement
-  //temperature_avg += (pgm_read_byte(&(therm_lut[index])) - temperature_avg)/(++temp_avg_n);
-  temperature_avg = pgm_read_byte(&(therm_lut[high]));
+  //temperature_avg = pgm_read_float(&(therm_lut[high]));
+  temperature_avg = 0.8*temperature_avg + 0.2*pgm_read_float(&(therm_lut[high]));
 }
 
 void measure_trimpot()
@@ -130,7 +129,6 @@ void measure_trimpot()
 
   // We only use few upper bit of the ADC value
   // for the trimpot value
-  uint8_t low = ADCL;
   uint8_t high = ADCH;
   trimpot_val = high >> 6;
 }
@@ -138,111 +136,87 @@ void measure_trimpot()
 void PID_compute()
 {
   /*Compute all the working error variables*/
-  float error = temperature_setPoints[trimpot_val] - temperature_avg;
+  float error = 37.5 - temperature_avg;
 
   // turn the LED2 on if we are close to set temperature
   if (fabs(error) < TEMP_SET_ERROR)
-  {
     LED2_ON();
-  }
   else
-  {
     LED2_OFF();
-  }
 
-  // integral term
-  ITerm += (K_i * TIME_INTERVAL * error);
+  // integral term (using trapze method)
+  ITerm += (K_i * TIME_INTERVAL * (error + error_previous)*0.5);
   if (ITerm > PWM_MAX) 
-  {
     ITerm = PWM_MAX;
-  }
   else if (ITerm < PWM_MIN) 
   {
     ITerm = PWM_MIN;
   }
 
   // differential term
-  float dInput = (temperature_avg - temperature_avg_previous) * TIME_INTERVAL_INV;
+  float dInput = (error - error_previous) * TIME_INTERVAL_INV;
 
   /*Compute PID Output*/
-  float output = K_p * error + ITerm - K_d * dInput;
+  float output = K_p * error + ITerm + K_d * dInput;
 
   // set PWM value
   if (output > PWM_MAX)
-  {
     pwm_val = PWM_MAX;
-  }
   else if (output < PWM_MIN) 
-  {
-    pwm_val = 0;
-  }
+    pwm_val = 0.;
   else
-  {
     pwm_val = (uint8_t)output;
-  }
 
   /*Remember some variables for next time*/
-  temperature_avg_previous = temperature_avg;
+  error_previous = error;
 }
 
 // Here we turn the relay off
 SIGNAL(TIMER1_COMPA_vect)
 {
   RELAY_OFF();
-
-  // start to average temperature 
-  // during period when relay is off
-  // We clock the ADC on TIMER0 at roughly 60Hz
-  /*
-  temperature_avg = 0.;
-  temp_avg_n = 0;
-  TCNT0 = 0x0;
-  TIMSK |= TOIE0; // enable overflow interrupt
-  TCCR0B = (1 << CS01) | (1 << CS00); // clk/64
-  */
-  measure_temperature();
-
+  state = WAIT;
 }
 
 // The timer overflow interrupt routine
 SIGNAL(TIMER1_OVF_vect)
 {
-  // turn TIMER0 off
-  //TCCR0B = 0x0;
-
   // turn relay off
   RELAY_OFF();
 
-  // do measurement when heating is off
-  measure_trimpot();
-
-
   if (trimpot_val > 0)
   {
-    // indicator LED
-    LED1_ON();
-    
-    // do the PID magic
-    PID_compute();
-
     // setup counter
     OCR1A = pwm_val;
 
     // turn on the heat!
+    state = HEAT;
     RELAY_ON();
+  }
+}
+
+SIGNAL(TIMER0_OVF_vect)
+{
+  // measure trimpot
+  measure_trimpot();
+
+  // measure only if relay is OFF
+  measure_temperature();
+
+  // do the PID magic
+  if (trimpot_val > 0)
+  {
+    LED1_ON();
+    PID_compute();
   }
   else
   {
     LED1_OFF();
+    pwm_val = 0;
+    ITerm = 0.0;
+    error_previous = 0.0;
   }
 }
-
-#if 0
-SIGNAL(TIMER0_OVF_vect)
-{
-  measure_temperature();
-}
-#endif
 
 int main()
 {
@@ -251,12 +225,17 @@ int main()
   // enable interrupts
   sei();
 
-  // ADC setting
-  ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+  // ADC setting, enabled, prescaled clk/16
+  ADCSRA = (1 << ADEN) | (1 << ADPS2);
+
+  // Setup TIMER0 as measurement clock
+  TCNT0 = 0x0;
+  TIMSK |= (1 << TOIE0); // enable overflow interrupt
+  TCCR0B = (1 << CS02) | (1 << CS00); // clk/1024
 
   // set up timer 1 as system clock
   TCNT1 = 0x0;            // counter at zero
-  TIMSK = (1 << TOIE1) | (1 << OCIE1A);   // set the overflow interrupt
+  TIMSK |= (1 << TOIE1) | (1 << OCIE1A);   // set the overflow interrupt
   TCCR1 = (1 << CS13) | (1 << CS12) | (1 << CS11) | (1 << CS10); // T1 clock to clk/16384
 
   // configure PB1 to switch relay
