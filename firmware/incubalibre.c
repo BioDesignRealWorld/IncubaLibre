@@ -7,6 +7,47 @@
 * ----------------------------------------------------------------------------
 */
 
+/*
+ * IncubaLibre
+ * ===========
+ *
+ * This is a cheap controller to regulate temperature in closed environment
+ * using a consumer heating element such as a light bulb or a blow dryer.
+ *
+ * Control Loop Flow
+ * -----------------
+ *
+ * The code uses TIMER1 as a slow PWM to switch a relay. 
+ * The duty cycle of the relay is controlled by a PID loop.
+ * The temperature is measured using a thermistor.
+ *
+ * The system clock of the ATtiny85 is left to the default 1MHz
+ * and the prescaler of TIMER1 is set to clk/16834, which means
+ * the loop period is ~4 seconds.
+ *
+ * Counter value ->
+ * +---------------+------------------------------------------+
+ * 0x0             OCR1A                                   0xFF
+ * |               |                                          |
+ * | Relay on      | Relay off (only when PWM on)             |
+ * |               |                                          |
+ * |               | On compare match interrupt               |
+ * |               |   - measure trimpot                      |
+ * |               |     - if trimpot != 0, start pwm         |
+ * |               |     - else stop pwm                      |
+ * |               |   - measure temperature                  |
+ * |               |     - if incubator running recompute PID |
+ * +---------------+------------------------------------------+
+ *
+ * Thermistor
+ * ----------
+ *
+ * The thermistor was calibrated using a thermocouple and some hot water.
+ * A look up table indexed on the ADC value is stored in the flash
+ * memory.
+ *
+ */
+
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
@@ -16,21 +57,20 @@
 #define ENTER_CRIT()    {char volatile saved_sreg = SREG; cli()
 #define LEAVE_CRIT()    SREG = saved_sreg;}
 
-// Time interval is 1MHz/1024/256
-#define TIME_INTERVAL 0.2621
-#define TIME_INTERVAL_INV 3.815
+// Time interval is 1MHz/16384/256
+#define TIME_INTERVAL 4.194304
+#define TIME_INTERVAL_INV 0.2384186
 
 // the state variable
-#define HEAT 0
-#define WAIT 1
-static uint8_t state = WAIT;
+#define PWM_ON 0
+#define PWM_OFF 1
+static uint8_t state = PWM_OFF;
 
 // error when we consider set point is reached
 #define TEMP_SET_ERROR 1.0
 
 // measurements
 uint8_t trimpot_val = 0;
-uint8_t pot_bits = 2;
 float temperature_avg = 0.;
 uint8_t temp_avg_n = 0;
 
@@ -59,6 +99,9 @@ uint8_t pwm_val = 0;
 #define LED1_OFF()  PORTB &= ~(1 << PB0)
 #define LED2_ON()   PORTB |= (1 << PB4)
 #define LED2_OFF()  PORTB &= ~(1 << PB4)
+
+#define START_PWM_1A() TCCR1 |= (1 << PWM1A) | (1 << COM1A1) | (1 << COM1A0)
+#define STOP_PWM_1A()  TCCR1 &= ~((1 << PWM1A) | (1 << COM1A1) | (1 << COM1A0))
 
 // Look-up table of Thermistor values
 const float therm_lut[] PROGMEM = { -66.89, -53.98, -47.36, -42.76, -39.19, -36.24, -33.71, -31.49, -29.51, -27.72, 
@@ -108,8 +151,8 @@ void measure_temperature()
   uint8_t high = ADCH;
 
   // average the temperature measurement
-  //temperature_avg = pgm_read_float(&(therm_lut[high]));
-  temperature_avg = 0.8*temperature_avg + 0.2*pgm_read_float(&(therm_lut[high]));
+  temperature_avg = pgm_read_float(&(therm_lut[high]));
+  //temperature_avg = 0.8*temperature_avg + 0.2*pgm_read_float(&(therm_lut[high]));
 }
 
 void measure_trimpot()
@@ -144,7 +187,7 @@ void PID_compute()
   else
     LED2_OFF();
 
-  // integral term (using trapze method)
+  // integral term (using trapeze method)
   ITerm += (K_i * TIME_INTERVAL * (error + error_previous)*0.5);
   if (ITerm > PWM_MAX) 
     ITerm = PWM_MAX;
@@ -174,48 +217,44 @@ void PID_compute()
 // Here we turn the relay off
 SIGNAL(TIMER1_COMPA_vect)
 {
-  RELAY_OFF();
-  state = WAIT;
+  measure_trimpot();
+  measure_temperature();
+  
+  if (trimpot_val > 0)
+  {
+    if (state == PWM_OFF)
+    {
+      START_PWM_1A();
+      state = PWM_ON;
+
+      LED1_ON();
+    }
+
+    // do the PID magic
+    PID_compute();
+  }
+  else
+  {
+    if (state == PWM_ON)
+    {
+      STOP_PWM_1A();
+      state = PWM_OFF;
+
+      RELAY_OFF();
+
+      LED1_OFF();
+      pwm_val = 0;
+      ITerm = 0.0;
+      error_previous = 0.0;
+    }
+  }
 }
 
 // The timer overflow interrupt routine
 SIGNAL(TIMER1_OVF_vect)
 {
-  // turn relay off
-  RELAY_OFF();
-
-  if (trimpot_val > 0)
-  {
-    // setup counter
-    OCR1A = pwm_val;
-
-    // turn on the heat!
-    state = HEAT;
-    RELAY_ON();
-  }
-}
-
-SIGNAL(TIMER0_OVF_vect)
-{
-  // measure trimpot
-  measure_trimpot();
-
-  // measure only if relay is OFF
-  measure_temperature();
-
-  // do the PID magic
-  if (trimpot_val > 0)
-  {
-    LED1_ON();
-    PID_compute();
-  }
-  else
-  {
-    LED1_OFF();
-    pwm_val = 0;
-    ITerm = 0.0;
-    error_previous = 0.0;
-  }
+  // set pwm duty cycle to value computed by PID
+  OCR1A = pwm_val;
 }
 
 int main()
@@ -227,11 +266,6 @@ int main()
 
   // ADC setting, enabled, prescaled clk/16
   ADCSRA = (1 << ADEN) | (1 << ADPS2);
-
-  // Setup TIMER0 as measurement clock
-  TCNT0 = 0x0;
-  TIMSK |= (1 << TOIE0); // enable overflow interrupt
-  TCCR0B = (1 << CS02) | (1 << CS00); // clk/1024
 
   // set up timer 1 as system clock
   TCNT1 = 0x0;            // counter at zero
