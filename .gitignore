@@ -1,0 +1,11 @@
+*.b#?
+../IncubaLibre_cut_outline.eps
+../IncubaLibre_mask_bot.eps
+../IncubaLibre_mask_top.eps
+*.s#?
+./ThermistorCalibration/lut.c
+eagle.epf
+*.swp
+*.elf
+*.hex
+*.o
